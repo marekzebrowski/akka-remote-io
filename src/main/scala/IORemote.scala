@@ -17,6 +17,7 @@ import scala.concurrent.{Future, Promise}
 
 class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef) extends AssociationHandle {
 
+  // you are creating lots of objects anyway, so buffering this array is not worth it. I would just allocate it in framed()
   val lenBuffer = new Array[Byte](4)
 
   val rhp = Promise[HandleEventListener]()
@@ -37,6 +38,7 @@ class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef)
   override def readHandlerPromise: Promise[HandleEventListener] = rhp
 
 
+  // don't worry too much about the copying. ByteString is a rope-like data structure, so the payload is not actually copied
   //lots of copying...
   def framed(payload: ByteString): ByteString = {
     val len = payload.length
@@ -73,7 +75,10 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
 
   implicit val ec = context.dispatcher
   var ah: IOAssociacionHandle = _
+  // it seems to me that this is only being accessed from within the actor. So why @volatile?
   @volatile var buffer: ByteString = ByteString.empty
+  // this saves one allocation. But with all the copying that is going on all over the place, I would guess that it is
+  // not worth it.
   val lenBytes = new Array[Byte](4)
 
 
