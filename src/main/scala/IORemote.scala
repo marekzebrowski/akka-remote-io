@@ -2,22 +2,29 @@ package pl.inti
 
 import java.net.{InetAddress, InetSocketAddress}
 
+import akka.OnlyCauseStackTrace
 import akka.actor._
 import akka.io.Inet.SO.ReuseAddress
 import akka.io.Tcp._
 import akka.io.{IO, Tcp}
+import akka.pattern.ask
 import akka.remote.transport.AssociationHandle.{Disassociated, HandleEventListener, InboundPayload}
 import akka.remote.transport.Transport.{AssociationEventListener, InboundAssociation}
 import akka.remote.transport.{AssociationHandle, Transport}
-import akka.util.ByteString
+import akka.util.{Timeout, ByteString}
+import scala.concurrent.duration._
+
 import com.typesafe.config.Config
 
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
+
+@SerialVersionUID(1L)
+class RemoteIoTransportException(msg: String, cause: Throwable) extends RuntimeException(msg, cause) with OnlyCauseStackTrace {
+  def this(msg: String) = this(msg, null)
+}
 
 
 class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef) extends AssociationHandle {
-
-  val lenBuffer = new Array[Byte](4)
 
   val rhp = Promise[HandleEventListener]()
 
@@ -36,15 +43,11 @@ class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef)
 
   override def readHandlerPromise: Promise[HandleEventListener] = rhp
 
-
-  //lots of copying...
+  //lots of copying... - maybe
   def framed(payload: ByteString): ByteString = {
     val len = payload.length
-    lenBuffer(0) = (len >>> 24).toByte
-    lenBuffer(1) = (len >>> 16).toByte
-    lenBuffer(2) = (len >>> 8).toByte
-    lenBuffer(3) = len.toByte
-    ByteString(lenBuffer) ++ payload
+    val frameSizeBS = ByteString((len >>> 24).toByte, (len >>> 16).toByte, (len >>> 8).toByte, len.toByte)
+    frameSizeBS ++ payload
   }
 }
 
@@ -60,7 +63,6 @@ object AssocActor {
   def props(localAddr: Address, remoteAddr: Address, p: Promise[AssociationHandle]) =
     Props(classOf[AssocActor], localAddr, remoteAddr, StartConnecting, p)
 
-
   def props(localAddr: Address, remoteAddr: Address, ah: IOAssociacionHandle) =
     Props(classOf[AssocActor], localAddr, remoteAddr, StartConnected(ah), Promise.successful(ah))
 
@@ -73,8 +75,7 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
 
   implicit val ec = context.dispatcher
   var ah: IOAssociacionHandle = _
-  @volatile var buffer: ByteString = ByteString.empty
-  val lenBytes = new Array[Byte](4)
+  var buffer: ByteString = ByteString.empty
 
 
   val socketAddress = new InetSocketAddress(remoteAddr.host.get, remoteAddr.port.get)
@@ -94,7 +95,7 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
   def connecting: Receive = {
     case CommandFailed(_: Connect) =>
       context stop self
-      p.failure(new RuntimeException("AssocActor - failed to connect"))
+      p.failure(new RemoteIoTransportException(s"AssocActor - failed to connect to ${remoteAddr}"))
 
     case c@Connected(remote, local) =>
       val connection = sender()
@@ -114,18 +115,18 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
       consumeBuffer()
 
     case _: ConnectionClosed =>
-      ah.readHandlerPromise.future.map(f => f.notify(Disassociated(AssociationHandle.Shutdown)))
+      ah.readHandlerPromise.future.foreach(_.notify(Disassociated(AssociationHandle.Shutdown)))
       context stop self
+
   }
 
   def messageLength(): Int = {
     if (buffer.length < 4) Integer.MAX_VALUE - 4
     else {
-      buffer.copyToArray(lenBytes, 0, 4)
-      (lenBytes(0) & 0xff) << 24 |
-        (lenBytes(1) & 0xff) << 16 |
-        (lenBytes(2) & 0xff) << 8 |
-        lenBytes(3) & 0xff
+      (buffer(0) & 0xff) << 24 |
+        (buffer(1) & 0xff) << 16 |
+        (buffer(2) & 0xff) << 8 |
+        buffer(3) & 0xff
     }
   }
 
@@ -135,8 +136,8 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
     if (buffer.length >= frameLen) {
       val (consumed, remaining) = buffer.splitAt(frameLen)
       val payload = consumed.slice(4, frameLen)
-      ah.readHandlerPromise.future.map { f =>
-        if(payload.nonEmpty) f.notify(InboundPayload(payload))
+      if (payload.nonEmpty) {
+        ah.readHandlerPromise.future.foreach(_.notify(InboundPayload(payload)))
       }
       buffer = remaining
       if (buffer.nonEmpty) consumeBuffer()
@@ -151,33 +152,49 @@ class IORemoteSettings(config: Config) {
     case value ⇒ value
   }
 
-  val port: Int = config.getInt("port")
+  val Port: Int = config.getInt("port")
+  val UseDispatcherForIo: Option[String] = config.getString("use-dispatcher-for-io") match {
+    case "" | null ⇒ None
+    case dispatcher ⇒ Some(dispatcher)
+  }
+  val Backlog: Int = config.getInt("backlog")
 }
 
+case class Associate(remoteAddr: Address, p: Promise[AssociationHandle])
+case object RemoteIOShutdown
 
 class IORemote(system: ExtendedActorSystem, conf: Config) extends Transport {
   val settings = new IORemoteSettings(conf)
   implicit val _system = system
-  implicit val ec = system.dispatcher
+  // no access to RARP - we are outside akka, so allow only own dispatcher
+  implicit val ec: ExecutionContext = settings.UseDispatcherForIo.map(system.dispatchers.lookup).getOrElse(system.dispatcher)
 
   val ioManager = IO(Tcp)
 
   var localAddr: Address = _
+
+  var handler: ActorRef = ActorRef.noSender
 
   override def schemeIdentifier: String = "tcp"
 
   override def listen: Future[(Address, Promise[AssociationEventListener])] = {
     val associationListenerPromise: Promise[AssociationEventListener] = Promise()
     val addressPromise = Promise[Address]
-    val handler = system.actorOf(Props(classOf[BindActor], addressPromise, associationListenerPromise.future, schemeIdentifier, system.name, settings))
+    val props = Props(classOf[BindActor], addressPromise, associationListenerPromise.future, schemeIdentifier, system.name, settings)
+    val propsWithDispatcher = settings.UseDispatcherForIo match {
+      case Some(dispatcherName) => props.withDispatcher(dispatcherName)
+      case None => props
+    }
+    handler = system.actorOf(propsWithDispatcher, "remote-io-handler")
     addressPromise.future.map { af =>
       (af, associationListenerPromise)
     }
   }
 
   override def shutdown(): Future[Boolean] = {
-    system.log.info("Shut down everything ...")
-    Future.successful(true)
+    implicit val timeout = Timeout(1 minute)
+    system.log.info("RemoteIO system shutting down ...")
+    (handler ? RemoteIOShutdown).mapTo[Boolean]
   }
 
   //TODO - configurable
@@ -187,7 +204,7 @@ class IORemote(system: ExtendedActorSystem, conf: Config) extends Transport {
 
   override def associate(remoteAddr: Address): Future[AssociationHandle] = {
     val p = Promise[AssociationHandle]
-    system.actorOf(AssocActor.props(localAddr, remoteAddr, p))
+    handler ! Associate(remoteAddr, p)
     p.future
   }
 }
@@ -195,29 +212,49 @@ class IORemote(system: ExtendedActorSystem, conf: Config) extends Transport {
 class BindActor(addressPromise: Promise[Address], assocListenerF: Future[AssociationEventListener], schemeIdentifier: String, systemName: String, settings: IORemoteSettings) extends Actor with ActorLogging {
   implicit val ec = context.dispatcher
   var address: Address = null
-  val localAddress = new InetSocketAddress(settings.Hostname, settings.port)
+  val bindLocalAddress = new InetSocketAddress(settings.Hostname, settings.Port)
   val options = List(ReuseAddress(true))
-  val backlog = 100
-  val pullMode = false
-  IO(Tcp)(context.system) ! Bind(self, localAddress, backlog, options, pullMode)
-
+  IO(Tcp)(context.system) ! Bind(self, bindLocalAddress, settings.Backlog, options, false)
+  var tcpActor = ActorRef.noSender
   def receive = {
-    case Bound(localAddress) =>
-      address = Address(schemeIdentifier, systemName, localAddress.getHostString, localAddress.getPort)
-      addressPromise.success(address)
-
-    case CommandFailed(_: Bind) => context stop self
-      log.warning("Bind Actor CommandFailed -don't know what to do")
-      addressPromise.failure(new IllegalArgumentException("cannot bind IO"))
-
     case c@Connected(remote, local) =>
       val connection = sender()
       val remoteAddr = Address(schemeIdentifier, systemName, remote.getHostString, remote.getPort)
       val ah = new IOAssociacionHandle(address, remoteAddr, connection)
-      val handler = context.actorOf(AssocActor.props(address, remoteAddr, ah))
+      val handler = context.actorOf(AssocActor.props(address, remoteAddr, ah), s"conn-${remote.getHostName}-${remote.getPort}")
       connection ! Register(handler)
-      assocListenerF.map { f =>
-        f.notify(InboundAssociation(ah))
-      }
+      assocListenerF.foreach(_.notify(InboundAssociation(ah)))
+
+    case Associate(remoteAddr, p) =>
+      context.actorOf(AssocActor.props(address, remoteAddr, p), s"conn-${remoteAddr.host.getOrElse("")}-${remoteAddr.port.getOrElse(0)}")
+
+    case Bound(localAddress) =>
+      tcpActor = sender()
+      address = Address(schemeIdentifier, systemName, localAddress.getHostString, localAddress.getPort)
+      addressPromise.success(address)
+
+    case CommandFailed(b: Bind) =>
+      log.warning("Bind Actor CommandFailed -don't know what to do")
+      addressPromise.failure(new RemoteIoTransportException(s"cannot bind IO to ${b.localAddress}"))
+      context stop self
+
+    case RemoteIOShutdown =>
+      //context.children foreach (child => child ! Disconnect - somehow)
+      tcpActor ! Unbind
+      context setReceiveTimeout (1 minute)
+      context become unbinding(sender())
+    }
+
+  def unbinding(replyTo:ActorRef): Receive = {
+    case Tcp.Unbound =>
+      log.info("Successful unbind")
+      replyTo ! true
+      context stop self
+
+    case ReceiveTimeout =>
+      log.info("Cannot unbind in time")
+      replyTo ! false
+      context stop self
   }
+
 }
