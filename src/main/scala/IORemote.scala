@@ -119,6 +119,7 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
       consumeBuffer()
 
     case _: ConnectionClosed =>
+      // mapping a future without storing the result. 1. use foreach? 2. what does it do?
       ah.readHandlerPromise.future.map(f => f.notify(Disassociated(AssociationHandle.Shutdown)))
       context stop self
   }
@@ -140,6 +141,7 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
     if (buffer.length >= frameLen) {
       val (consumed, remaining) = buffer.splitAt(frameLen)
       val payload = consumed.slice(4, frameLen)
+      // again, mapping without storing the result. Foreach?
       ah.readHandlerPromise.future.map { f =>
         if(payload.nonEmpty) f.notify(InboundPayload(payload))
       }
