@@ -7,7 +7,7 @@ import scala.concurrent.Promise
 import scala.io.StdIn
 import scala.concurrent.ExecutionContext.Implicits.global
 class EchoActor extends Actor {
-  var cnt = 0
+  var cnt = 1
   def receive = {
     case x: String =>
       val s= sender()
@@ -35,8 +35,8 @@ class SenderActor(as: ActorSelection, p: Promise[Unit]) extends Actor with Actor
     case x:String =>
       val s= sender()
       rcvCounter = rcvCounter + 1
+      log.info("got string  {} from {}, counter is {}",x, s, rcvCounter)
       if(rcvCounter >= expCounter) p.success(())
-      log.info("got string from {}, {}, counter is {}",s, x, rcvCounter)
 
 
   }
