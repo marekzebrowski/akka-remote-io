@@ -24,21 +24,27 @@ class RemoteIoTransportException(msg: String, cause: Throwable) extends RuntimeE
 }
 
 
-class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef) extends AssociationHandle {
+class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef, se: ActorRef) extends AssociationHandle {
 
+  @volatile var msgSender = se
   val rhp = Promise[HandleEventListener]()
 
   override def localAddress: Address = local
 
   override def remoteAddress: Address = remote
 
+  @volatile var failureState: Boolean = false
+
   override def disassociate(): Unit = {
     connection ! Close
   }
 
   override def write(payload: ByteString): Boolean = {
-    connection ! Write(framed(payload))
-    true
+    if(failureState) false
+    else {
+      connection.!(Write(framed(payload)))(msgSender)
+      true
+    }
   }
 
   override def readHandlerPromise: Promise[HandleEventListener] = rhp
@@ -49,6 +55,12 @@ class IOAssociacionHandle(local: Address, remote: Address, connection: ActorRef)
     val frameSizeBS = ByteString((len >>> 24).toByte, (len >>> 16).toByte, (len >>> 8).toByte, len.toByte)
     frameSizeBS ++ payload
   }
+
+  def setFailureState(): Unit = failureState=true
+
+  def clearFailureState(): Unit = failureState=false
+
+  def setSender(handler: ActorRef) = msgSender = handler
 }
 
 
@@ -99,7 +111,7 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
 
     case c@Connected(remote, local) =>
       val connection = sender()
-      ah = new IOAssociacionHandle(localAddr, remoteAddr, connection)
+      ah = new IOAssociacionHandle(localAddr, remoteAddr, connection, self)
       p.success(ah)
       connection ! Register(self)
       context become connected
@@ -109,7 +121,11 @@ class AssocActor(localAddr: Address, remoteAddr: Address, startMessage: AssocAct
   def connected: Receive = {
     case CommandFailed(w: Write) =>
       // O/S buffer was full
-      log.warning("AssocActor = write buffer full {}", w)
+      //log.warning("AssocActor = write buffer full {}", w)
+      ah.setFailureState()
+      //set clear failure in 50 millis
+      context.system.scheduler.scheduleOnce(20 millis)(ah.clearFailureState())
+
     case Received(data) =>
       buffer = buffer ++ data
       consumeBuffer()
@@ -220,8 +236,9 @@ class BindActor(addressPromise: Promise[Address], assocListenerF: Future[Associa
     case c@Connected(remote, local) =>
       val connection = sender()
       val remoteAddr = Address(schemeIdentifier, systemName, remote.getHostString, remote.getPort)
-      val ah = new IOAssociacionHandle(address, remoteAddr, connection)
+      val ah = new IOAssociacionHandle(address, remoteAddr, connection, ActorRef.noSender)
       val handler = context.actorOf(AssocActor.props(address, remoteAddr, ah), s"conn-${remote.getHostName}-${remote.getPort}")
+      ah.setSender(handler)
       connection ! Register(handler)
       assocListenerF.foreach(_.notify(InboundAssociation(ah)))
 
